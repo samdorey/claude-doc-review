@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+# Google Docs mode — OAuth client secrets and cached token (keep private)
+credentials.json
+google-token.json

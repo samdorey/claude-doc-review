@@ -1,0 +1,4 @@
+# Only needed for the Google Docs mode (gdocs_review.py).
+# The Markdown tool (reviewer.py / review.py) needs none of these — stdlib only.
+google-api-python-client>=2.0
+google-auth-oauthlib>=1.0
