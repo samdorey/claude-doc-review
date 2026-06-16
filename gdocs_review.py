@@ -328,7 +328,7 @@ def _require_anthropic():
 
 def _resolve_model(args):
     return (getattr(args, "model", None) or os.environ.get("ANTHROPIC_MODEL")
-            or "claude-sonnet-4-6")
+            or "claude-opus-4-8")
 
 
 def _propose_doc(drive, docs, did, claude_email, client, model, verbose=False):
@@ -449,27 +449,46 @@ def cmd_run(args):
     print(f"Proposed on {n} thread(s).")
 
 
-def cmd_auto(args):
-    """Autonomous pass over every doc shared with the account: apply approved
-    rewrites, then propose on new Claude-addressed threads. Built for a scheduler."""
-    client = _require_anthropic()
-    model = _resolve_model(args)
-    drive, docs = services()
-    _, claude_email = whoami(drive)
+def _auto_pass(drive, docs, claude_email, client, model, verbose=False):
     shared = docs_shared_with_sa(drive)
     total_p = total_a = 0
     for did, name in shared:
         try:
-            a = _apply_approved_doc(drive, docs, did, claude_email, verbose=args.verbose)
-            p = _propose_doc(drive, docs, did, claude_email, client, model, verbose=args.verbose)
+            a = _apply_approved_doc(drive, docs, did, claude_email, verbose=verbose)
+            p = _propose_doc(drive, docs, did, claude_email, client, model, verbose=verbose)
         except Exception as e:  # one bad doc shouldn't stop the pass
-            print(f"[{name or did}] error: {e}")
+            print(f"[{name or did}] error: {e}", flush=True)
             continue
         total_p += p
         total_a += a
-        if p or a or args.verbose:
-            print(f"{name or did}: proposed {p}, applied {a}")
-    print(f"done — docs={len(shared)} proposed={total_p} applied={total_a}")
+        if p or a or verbose:
+            print(f"{name or did}: proposed {p}, applied {a}", flush=True)
+    # Stay quiet on idle passes so the watcher's logs aren't a heartbeat wall.
+    if total_p or total_a or verbose:
+        print(f"done — docs={len(shared)} proposed={total_p} applied={total_a}", flush=True)
+    return total_p, total_a
+
+
+def cmd_auto(args):
+    """Autonomous pass over every doc shared with the account: apply approved
+    rewrites, then propose on new Claude-addressed threads. With --interval, loop
+    forever (the persistent-watcher mode a systemd service runs)."""
+    client = _require_anthropic()
+    model = _resolve_model(args)
+    drive, docs = services()
+    _, claude_email = whoami(drive)
+    if not args.interval:
+        _auto_pass(drive, docs, claude_email, client, model, verbose=args.verbose)
+        return
+    import time
+    print(f"watching every {args.interval}s as {claude_email} (model {model}); "
+          "Ctrl-C to stop.", flush=True)
+    while True:
+        try:
+            _auto_pass(drive, docs, claude_email, client, model, verbose=args.verbose)
+        except Exception as e:  # never let one bad pass kill the watcher
+            print(f"pass error: {e}", flush=True)
+        time.sleep(args.interval)
 
 
 def cmd_reply(args):
@@ -591,10 +610,12 @@ def main():
 
     p = sub.add_parser("run", help="generate rewrites for open Claude-addressed threads via the Claude API")
     p.add_argument("doc", help="Google Docs URL or document id")
-    p.add_argument("--model", help="Claude model id (default: $ANTHROPIC_MODEL or claude-sonnet-4-6)")
+    p.add_argument("--model", help="Claude model id (default: $ANTHROPIC_MODEL or claude-opus-4-8)")
 
     p = sub.add_parser("auto", help="autonomous pass over all shared docs: apply approved rewrites, propose new ones")
-    p.add_argument("--model", help="Claude model id (default: $ANTHROPIC_MODEL or claude-sonnet-4-6)")
+    p.add_argument("--model", help="Claude model id (default: $ANTHROPIC_MODEL or claude-opus-4-8)")
+    p.add_argument("--interval", type=int, metavar="SECONDS",
+                   help="run forever, polling every SECONDS (persistent-watcher mode)")
     p.add_argument("-v", "--verbose", action="store_true", help="print per-doc / per-thread detail")
 
     p = sub.add_parser("reply", help="reply in a comment thread")
