@@ -265,8 +265,13 @@ RUN_SYSTEM = (
     "instruction about that excerpt. Produce a revised version of ONLY the "
     "highlighted excerpt that satisfies the instruction while preserving the "
     "author's meaning, voice, and the flow into the surrounding text. Output only "
-    "the replacement text — no quotation marks, no preamble, no explanation."
+    "the replacement text — no quotation marks, no preamble, no explanation.\n"
+    "If the reader asks you to delete or remove the highlighted excerpt entirely "
+    "(rather than rewrite it), respond with exactly <<DELETE>> and nothing else."
 )
+
+DELETE_SENTINEL = "<<DELETE>>"  # what the model emits for a deletion request
+DELETE_MARKER = "[delete this passage entirely]"  # human-readable form shown in the proposal
 
 
 PROPOSAL_PREFIX = "Proposed rewrite"
@@ -356,13 +361,14 @@ def _propose_doc(drive, docs, did, claude_email, client, model, verbose=False):
             messages=[{"role": "user", "content": user}],
         )
         rewrite = "".join(b.text for b in resp.content if b.type == "text").strip()
+        shown = DELETE_MARKER if rewrite == DELETE_SENTINEL else rewrite
         drive.replies().create(
             fileId=did, commentId=c["id"],
-            body={"content": PROPOSAL_PREFIX + " (reply 👍 / yes to apply):\n\n" + rewrite},
+            body={"content": PROPOSAL_PREFIX + " (reply 👍 / yes to apply):\n\n" + shown},
             fields="id",
         ).execute()
         if verbose:
-            print(f"  [{c['id']}] proposed ({len(rewrite)} chars, "
+            print(f"  [{c['id']}] proposed ({len(shown)} chars, "
                   f"cache_read={resp.usage.cache_read_input_tokens} tok)")
     return len(todo)
 
@@ -393,11 +399,13 @@ def _apply_approved_doc(drive, docs, did, claude_email, verbose=False):
             continue
         new_text = proposal_text.split("\n\n", 1)[1] if "\n\n" in proposal_text else proposal_text
         new_text = html.unescape(new_text).rsplit("<br>", 1)[0].strip()
+        is_delete = new_text == DELETE_MARKER
+        replace_with = "" if is_delete else new_text
         res = docs.documents().batchUpdate(
             documentId=did,
             body={"requests": [{"replaceAllText": {
                 "containsText": {"text": original, "matchCase": True},
-                "replaceText": new_text}}]},
+                "replaceText": replace_with}}]},
         ).execute()
         n = res.get("replies", [{}])[0].get("replaceAllText", {}).get("occurrencesChanged", 0)
         if n == 0:
@@ -410,11 +418,10 @@ def _apply_approved_doc(drive, docs, did, claude_email, verbose=False):
             if verbose:
                 print(f"  [{c['id']}] could not apply (anchored text changed)")
             continue
+        confirm = (f'{APPLIED_PREFIX}: deleted "{squash(original, 80)}".' if is_delete
+                   else f'{APPLIED_PREFIX}: "{squash(original, 80)}" → "{squash(new_text, 80)}".')
         drive.replies().create(
-            fileId=did, commentId=c["id"],
-            body={"content": f'{APPLIED_PREFIX}: "{squash(original, 80)}" '
-                  f'→ "{squash(new_text, 80)}".'},
-            fields="id",
+            fileId=did, commentId=c["id"], body={"content": confirm}, fields="id",
         ).execute()
         applied += 1
         if verbose:
