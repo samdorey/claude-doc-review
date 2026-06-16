@@ -194,6 +194,20 @@ def list_comments(drive, did, include_resolved=False):
     return out
 
 
+def is_multi_tab(docs, did):
+    """True if the doc is organised into more than one tab.
+
+    Multi-tab docs need tab-aware reads/edits the rest of this tool doesn't do
+    yet, so callers skip them. Only called when a doc actually has work to do.
+    """
+    d = docs.documents().get(documentId=did, includeTabsContent=True).execute()
+
+    def count(tabs):
+        return sum(1 + count(t.get("childTabs", [])) for t in tabs)
+
+    return count(d.get("tabs", [])) > 1
+
+
 def doc_text(docs, did):
     """Return the document body as plain text (paragraphs joined by newlines)."""
     doc = docs.documents().get(documentId=did).execute()
@@ -286,6 +300,9 @@ FORMAT_MARKER = "<<FMT>>"  # precedes the base64 directive embedded in the propo
 PROPOSAL_PREFIX = "Proposed rewrite"
 APPLIED_PREFIX = "Applied your approved change"
 CANT_APPLY_PREFIX = "Couldn't apply automatically"
+MULTITAB_NOTE = ("This document uses multiple tabs, which Claude review doesn't "
+                 "support yet — skipping it to avoid editing the wrong tab. "
+                 "(Multi-tab support is in progress.)")
 APPROVAL_WORDS = {
     "yes", "y", "yep", "yeah", "ok", "okay", "approve", "approved",
     "lgtm", "do it", "apply", "go", "go ahead", "sounds good", "perfect",
@@ -405,7 +422,6 @@ def _apply_formatting(docs, did, spans):
 def _propose_doc(drive, docs, did, claude_email, client, model, verbose=False):
     """Post Claude-generated rewrite proposals on new threads addressed to Claude."""
     import html
-    _, body = doc_text(docs, did)
     todo = [
         c for c in list_comments(drive, did)
         if c.get("quotedFileContent", {}).get("value")
@@ -414,6 +430,15 @@ def _propose_doc(drive, docs, did, claude_email, client, model, verbose=False):
     ]
     if not todo:
         return 0
+    if is_multi_tab(docs, did):
+        for c in todo:  # one-time note → marks the thread handled, so no re-noting
+            drive.replies().create(
+                fileId=did, commentId=c["id"], body={"content": MULTITAB_NOTE}, fields="id",
+            ).execute()
+        if verbose:
+            print(f"  multi-tab doc — noted & skipped {len(todo)} thread(s)")
+        return 0
+    _, body = doc_text(docs, did)
     system = _claude_system(body)
     for c in todo:
         excerpt = html.unescape(c.get("quotedFileContent", {}).get("value", ""))
@@ -454,6 +479,7 @@ def _apply_approved_doc(drive, docs, did, claude_email, verbose=False):
     """Apply rewrites on threads the reader approved (👍) that aren't applied yet."""
     import html
     applied = 0
+    multitab = None  # computed lazily, only if a thread is actually ready to apply
     for c in list_comments(drive, did):
         if c.get("resolved"):
             continue
@@ -473,6 +499,16 @@ def _apply_approved_doc(drive, docs, did, claude_email, verbose=False):
             elif who != claude_email and seen_proposal and _is_approval(r.get("content", "")):
                 approved = True
         if not (seen_proposal and approved and not terminal and proposal_text):
+            continue
+        if multitab is None:
+            multitab = is_multi_tab(docs, did)
+        if multitab:  # terminal note (CANT_APPLY_PREFIX) so it isn't retried/spammed
+            drive.replies().create(
+                fileId=did, commentId=c["id"],
+                body={"content": CANT_APPLY_PREFIX + " — this document uses multiple "
+                      "tabs (not supported yet)."},
+                fields="id",
+            ).execute()
             continue
         new_text = proposal_text.split("\n\n", 1)[1] if "\n\n" in proposal_text else proposal_text
         new_text = html.unescape(new_text).rsplit("<br>", 1)[0].strip()
