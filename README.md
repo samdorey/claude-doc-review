@@ -68,35 +68,77 @@ Same idea, but the document is a real Google Doc and the comments are Google's o
 
 ### One-time setup
 
-Create a "Claude Review" Google account + OAuth credentials, then sign in. Full walkthrough in **[SETUP_GOOGLE.md](SETUP_GOOGLE.md)**. Short version:
+You need **two credentials**, both kept locally and git-ignored:
+
+1. **Google access** — a *service account* is the recommended identity (headless, no browser, its own non-human author). Create a Google Cloud project, enable the Drive + Docs APIs, create a service-account key, and save it next to the script as `credentials.json`. Full walkthrough (and the alternative OAuth-account route) in **[SETUP_GOOGLE.md](SETUP_GOOGLE.md)**.
+2. **Anthropic API key** — only needed for `run` / `auto` (Claude-generated rewrites). Get one from the [Anthropic Console](https://console.anthropic.com) → **API Keys** → **Create Key**, then put it in a `.env` beside the script (the script loads it automatically). Copy **[.env.example](.env.example)** to `.env` and fill it in.
 
 ```sh
-pip install -r requirements.txt          # google-api-python-client, google-auth-oauthlib
-# (save OAuth desktop credentials as credentials.json — see SETUP_GOOGLE.md)
-python3 gdocs_review.py auth             # sign in as the Claude Review account
+pip install -r requirements.txt          # google-api-python-client, google-auth-oauthlib, anthropic
+# save the service-account key as credentials.json — see SETUP_GOOGLE.md
+cp .env.example .env                      # then add your ANTHROPIC_API_KEY
+python3 gdocs_review.py auth             # confirms which account you're authenticated as
 ```
 
-Then **share** each doc you want reviewed with the Claude Review account (Editor).
+Then **share** each doc you want reviewed with the service-account email (Editor). Its address is shown by `gdocs_review.py auth` and looks like `claude@<project>.iam.gserviceaccount.com`.
 
 ### The loop
 
-1. In Google Docs, highlight text and add a comment (natively anchored) — "tighten this", "is this accurate?", etc.
-2. Tell Claude: *"do a review pass on `<doc url>`"*.
-3. Claude reads every open thread and the doc body, then replies in each thread as **Claude Review** and resolves what it has handled.
-4. You read the replies in the Google Docs comment sidebar. Repeat.
+1. In Google Docs, highlight text and add a comment that **@mentions the Claude account** — "@claude tighten this", "@claude delete this section", etc.
+2. Claude generates a rewrite and posts it as a **proposal** reply in the thread.
+3. You reply **👍** (or "yes") to approve — Claude then **applies** the edit to the highlighted text and leaves the thread open so its confirmation stays visible. (Reply anything else, or edit your instruction, to iterate.)
+
+You can drive this manually (`run` then `apply`), or let the autonomous watcher do it for you (below).
 
 ### `gdocs_review.py` commands
 
 ```sh
-python3 gdocs_review.py auth                                  # one-time sign-in
+python3 gdocs_review.py auth                                  # confirm identity (service account or OAuth)
 python3 gdocs_review.py status   <doc>                        # open threads + doc body
+python3 gdocs_review.py run      <doc> [--model ID]           # propose rewrites on @claude threads (Claude API)
+python3 gdocs_review.py apply    <comment_id> "new" <doc>     # apply an approved rewrite (--resolve to close)
+python3 gdocs_review.py auto     [--interval SECONDS] [-v]    # autonomous pass over ALL shared docs
 python3 gdocs_review.py reply    <comment_id> "msg" <doc>     # reply in a thread (--resolve to close it)
 python3 gdocs_review.py resolve  <comment_id> <doc>           # resolve a thread (--note "…")
 python3 gdocs_review.py comment  "msg" <doc> [--quote "text"] # new (un-anchored) comment
 python3 gdocs_review.py replace  "old" "new" <doc>            # edit the doc text directly (Docs API)
 ```
 
-`<doc>` is a full Google Docs URL or a bare document id. Credentials and the cached token live next to the script and in `.review/` (both git-ignored).
+`<doc>` is a full Google Docs URL or a bare document id. The default model is `claude-opus-4-8` (override with `--model` or `ANTHROPIC_MODEL` in `.env`). Credentials and the cached token live next to the script and in `.review/` (both git-ignored).
+
+### Autonomous mode (the "just works" loop)
+
+`auto` reconciles **every doc shared with the account** in one pass: it applies any 👍-approved rewrites, then proposes on new `@claude` threads. With `--interval`, it loops forever, keeping the Google clients warm — the persistent-watcher mode meant to run under a scheduler.
+
+To run it continuously on Linux, install it as a **systemd user service** so it survives logout and reboot:
+
+```ini
+# ~/.config/systemd/user/gdocs-review.service
+[Unit]
+Description=Claude Google Docs review watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/claude-doc-review
+ExecStart=/path/to/claude-doc-review/.venv/bin/python3 /path/to/claude-doc-review/gdocs_review.py auto --interval 15
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now gdocs-review.service
+loginctl enable-linger "$USER"     # start at boot without an interactive login
+```
+
+Inspect it with `journalctl _SYSTEMD_USER_UNIT=gdocs-review.service` (idle passes are silent). After editing `gdocs_review.py`, run `systemctl --user restart gdocs-review.service` to pick up the change.
+
+> ⚠️ The watcher writes to docs **autonomously once you 👍** — the 👍 is the only gate — and it acts on *every* doc shared with the service account. Share deliberately.
 
 ## Notes
 
