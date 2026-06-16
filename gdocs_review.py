@@ -25,6 +25,10 @@ Commands:
   gdocs_review.py run <doc> [--model ID]        For each open thread addressed to Claude
                                                 with no reply yet, generate a rewrite via
                                                 the Claude API and post it as a proposal.
+  gdocs_review.py auto [--model ID] [-v]        Autonomous pass over every doc shared with
+                                                the account: apply 👍-approved rewrites,
+                                                then propose on new Claude threads. For cron
+                                                / systemd timer use.
   gdocs_review.py reply <comment_id> "msg" <doc> Reply in a thread, as Claude Review.
   gdocs_review.py resolve <comment_id> <doc>    Resolve a thread (optionally with a note).
   gdocs_review.py comment "msg" <doc> [--quote "text"]
@@ -45,6 +49,7 @@ an OAuth "desktop app" client, save the client secrets next to this script as
 import os
 import re
 import sys
+import logging
 import argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -264,6 +269,15 @@ RUN_SYSTEM = (
 )
 
 
+PROPOSAL_PREFIX = "Proposed rewrite"
+APPLIED_PREFIX = "Applied your approved change"
+CANT_APPLY_PREFIX = "Couldn't apply automatically"
+APPROVAL_WORDS = {
+    "yes", "y", "yep", "yeah", "ok", "okay", "approve", "approved",
+    "lgtm", "do it", "apply", "go", "go ahead", "sounds good", "perfect",
+}
+
+
 def _thread_instruction(comment, claude_email):
     """The reader's request: the comment plus any of their follow-up replies."""
     import html
@@ -277,84 +291,185 @@ def _thread_instruction(comment, claude_email):
     return "\n".join(p for p in parts if p)
 
 
-def cmd_run(args):
-    import html
+def _is_approval(text):
+    t = (text or "").strip().lower()
+    return "👍" in (text or "") or t in APPROVAL_WORDS or t.startswith("yes")
+
+
+def _claude_system(body):
+    return [
+        {"type": "text", "text": RUN_SYSTEM},
+        {"type": "text",
+         "text": f"FULL DOCUMENT (for context only):\n\n{body}",
+         "cache_control": {"type": "ephemeral"}},
+    ]
+
+
+def _addressed_to_claude(c, claude_email):
+    blob = (c.get("content", "") + " " +
+            " ".join(r.get("content", "") for r in c.get("replies", []))).lower()
+    return claude_email.lower() in blob or "@claude" in blob
+
+
+def _claude_has_replied(c, claude_email):
+    return any(r.get("author", {}).get("displayName") == claude_email
+               for r in c.get("replies", []))
+
+
+def _require_anthropic():
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        die("ANTHROPIC_API_KEY is not set. Export your Claude API key first.")
+        die("ANTHROPIC_API_KEY is not set (put it in a .env beside this script).")
     try:
         import anthropic
     except ImportError:
         die("the 'anthropic' package is missing. Run:  pip install -r requirements.txt")
+    return anthropic.Anthropic()
 
-    model = args.model or os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-6"
 
-    drive, docs = services()
-    did = doc_id(args.doc)
-    _, claude_email = whoami(drive)
-    title, body = doc_text(docs, did)
-    comments = list_comments(drive, did)
+def _resolve_model(args):
+    return (getattr(args, "model", None) or os.environ.get("ANTHROPIC_MODEL")
+            or "claude-sonnet-4-6")
 
-    def addressed_to_claude(c):
-        blob = c.get("content", "") + " " + " ".join(
-            r.get("content", "") for r in c.get("replies", [])
-        )
-        low = blob.lower()
-        return claude_email.lower() in low or "@claude" in low
 
-    def already_handled(c):
-        return any(
-            r.get("author", {}).get("displayName") == claude_email
-            for r in c.get("replies", [])
-        )
-
+def _propose_doc(drive, docs, did, claude_email, client, model, verbose=False):
+    """Post Claude-generated rewrite proposals on new threads addressed to Claude."""
+    import html
+    _, body = doc_text(docs, did)
     todo = [
-        c for c in comments
+        c for c in list_comments(drive, did)
         if c.get("quotedFileContent", {}).get("value")
-        and addressed_to_claude(c)
-        and not already_handled(c)
+        and _addressed_to_claude(c, claude_email)
+        and not _claude_has_replied(c, claude_email)
     ]
-
-    print(f"Doc: {title or did}")
-    print(f"Model: {model}")
-    print(f"Open threads for Claude with no reply yet: {len(todo)}")
     if not todo:
-        return
-
-    client = anthropic.Anthropic()
-    system = [
-        {"type": "text", "text": RUN_SYSTEM},
-        {
-            "type": "text",
-            "text": f"FULL DOCUMENT (for context only):\n\n{body}",
-            "cache_control": {"type": "ephemeral"},
-        },
-    ]
-
+        return 0
+    system = _claude_system(body)
     for c in todo:
         excerpt = html.unescape(c.get("quotedFileContent", {}).get("value", ""))
-        instruction = _thread_instruction(c, claude_email)
         user = (
             f"Highlighted excerpt:\n{excerpt}\n\n"
-            f"Reader's instruction:\n{instruction}\n\n"
+            f"Reader's instruction:\n{_thread_instruction(c, claude_email)}\n\n"
             "Return only the rewritten replacement for the highlighted excerpt."
         )
         resp = client.messages.create(
-            model=model,
-            max_tokens=2000,
-            system=system,
+            model=model, max_tokens=2000, system=system,
             messages=[{"role": "user", "content": user}],
         )
         rewrite = "".join(b.text for b in resp.content if b.type == "text").strip()
-        cached = resp.usage.cache_read_input_tokens
-        body_reply = (
-            "Proposed rewrite (reply 👍 / yes to apply):\n\n" + rewrite
-        )
         drive.replies().create(
-            fileId=did, commentId=c["id"], body={"content": body_reply},
+            fileId=did, commentId=c["id"],
+            body={"content": PROPOSAL_PREFIX + " (reply 👍 / yes to apply):\n\n" + rewrite},
             fields="id",
         ).execute()
-        print(f"[{c['id']}] proposed ({len(rewrite)} chars, cache_read={cached} tok): "
-              f"{squash(rewrite, 80)}")
+        if verbose:
+            print(f"  [{c['id']}] proposed ({len(rewrite)} chars, "
+                  f"cache_read={resp.usage.cache_read_input_tokens} tok)")
+    return len(todo)
+
+
+def _apply_approved_doc(drive, docs, did, claude_email, verbose=False):
+    """Apply rewrites on threads the reader approved (👍) that aren't applied yet."""
+    import html
+    applied = 0
+    for c in list_comments(drive, did):
+        if c.get("resolved"):
+            continue
+        original = html.unescape(c.get("quotedFileContent", {}).get("value", ""))
+        if not original:
+            continue
+        seen_proposal = approved = terminal = False
+        proposal_text = None
+        for r in c.get("replies", []):
+            who = r.get("author", {}).get("displayName")
+            content = (r.get("content", "") or "").lstrip()
+            if who == claude_email and content.startswith(PROPOSAL_PREFIX):
+                seen_proposal, proposal_text, approved, terminal = True, r["content"], False, False
+            elif who == claude_email and (content.startswith(APPLIED_PREFIX)
+                                          or content.startswith(CANT_APPLY_PREFIX)):
+                terminal = True
+            elif who != claude_email and seen_proposal and _is_approval(r.get("content", "")):
+                approved = True
+        if not (seen_proposal and approved and not terminal and proposal_text):
+            continue
+        new_text = proposal_text.split("\n\n", 1)[1] if "\n\n" in proposal_text else proposal_text
+        new_text = html.unescape(new_text).rsplit("<br>", 1)[0].strip()
+        res = docs.documents().batchUpdate(
+            documentId=did,
+            body={"requests": [{"replaceAllText": {
+                "containsText": {"text": original, "matchCase": True},
+                "replaceText": new_text}}]},
+        ).execute()
+        n = res.get("replies", [{}])[0].get("replaceAllText", {}).get("occurrencesChanged", 0)
+        if n == 0:
+            drive.replies().create(
+                fileId=did, commentId=c["id"],
+                body={"content": CANT_APPLY_PREFIX + " — the highlighted text changed "
+                      "since the proposal. Re-comment to try again."},
+                fields="id",
+            ).execute()
+            if verbose:
+                print(f"  [{c['id']}] could not apply (anchored text changed)")
+            continue
+        drive.replies().create(
+            fileId=did, commentId=c["id"],
+            body={"content": f'{APPLIED_PREFIX}: "{squash(original, 80)}" '
+                  f'→ "{squash(new_text, 80)}".'},
+            fields="id",
+        ).execute()
+        applied += 1
+        if verbose:
+            print(f"  [{c['id']}] applied ({n} occurrence(s))")
+    return applied
+
+
+def docs_shared_with_sa(drive):
+    """Every non-trashed Google Doc the account can see (i.e. shared with it)."""
+    out, token = [], None
+    while True:
+        resp = drive.files().list(
+            q="mimeType='application/vnd.google-apps.document' and trashed=false",
+            fields="files(id,name),nextPageToken", pageSize=100, pageToken=token,
+        ).execute()
+        out.extend((f["id"], f.get("name", "")) for f in resp.get("files", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return out
+
+
+def cmd_run(args):
+    client = _require_anthropic()
+    model = _resolve_model(args)
+    drive, docs = services()
+    did = doc_id(args.doc)
+    _, claude_email = whoami(drive)
+    title, _ = doc_text(docs, did)
+    print(f"Doc: {title or did}\nModel: {model}")
+    n = _propose_doc(drive, docs, did, claude_email, client, model, verbose=True)
+    print(f"Proposed on {n} thread(s).")
+
+
+def cmd_auto(args):
+    """Autonomous pass over every doc shared with the account: apply approved
+    rewrites, then propose on new Claude-addressed threads. Built for a scheduler."""
+    client = _require_anthropic()
+    model = _resolve_model(args)
+    drive, docs = services()
+    _, claude_email = whoami(drive)
+    shared = docs_shared_with_sa(drive)
+    total_p = total_a = 0
+    for did, name in shared:
+        try:
+            a = _apply_approved_doc(drive, docs, did, claude_email, verbose=args.verbose)
+            p = _propose_doc(drive, docs, did, claude_email, client, model, verbose=args.verbose)
+        except Exception as e:  # one bad doc shouldn't stop the pass
+            print(f"[{name or did}] error: {e}")
+            continue
+        total_p += p
+        total_a += a
+        if p or a or args.verbose:
+            print(f"{name or did}: proposed {p}, applied {a}")
+    print(f"done — docs={len(shared)} proposed={total_p} applied={total_a}")
 
 
 def cmd_reply(args):
@@ -463,6 +578,9 @@ def cmd_replace(args):
 
 def main():
     load_env()
+    # Silence the best-effort "Regional Access Boundary" lookup warning google-auth
+    # emits for service-account creds off-GCP; the lookup fails but auth still works.
+    logging.getLogger("google.oauth2._client").setLevel(logging.ERROR)
     ap = argparse.ArgumentParser(description="Review a Google Doc via native comments.")
     sub = ap.add_subparsers(dest="command")
 
@@ -474,6 +592,10 @@ def main():
     p = sub.add_parser("run", help="generate rewrites for open Claude-addressed threads via the Claude API")
     p.add_argument("doc", help="Google Docs URL or document id")
     p.add_argument("--model", help="Claude model id (default: $ANTHROPIC_MODEL or claude-sonnet-4-6)")
+
+    p = sub.add_parser("auto", help="autonomous pass over all shared docs: apply approved rewrites, propose new ones")
+    p.add_argument("--model", help="Claude model id (default: $ANTHROPIC_MODEL or claude-sonnet-4-6)")
+    p.add_argument("-v", "--verbose", action="store_true", help="print per-doc / per-thread detail")
 
     p = sub.add_parser("reply", help="reply in a comment thread")
     p.add_argument("comment_id")
@@ -507,9 +629,9 @@ def main():
     args = ap.parse_args()
     cmd = args.command or "help"
     fn = {
-        "auth": cmd_auth, "status": cmd_status, "run": cmd_run, "reply": cmd_reply,
-        "resolve": cmd_resolve, "comment": cmd_comment, "apply": cmd_apply,
-        "replace": cmd_replace,
+        "auth": cmd_auth, "status": cmd_status, "run": cmd_run, "auto": cmd_auto,
+        "reply": cmd_reply, "resolve": cmd_resolve, "comment": cmd_comment,
+        "apply": cmd_apply, "replace": cmd_replace,
     }.get(cmd)
     if not fn:
         ap.print_help()
