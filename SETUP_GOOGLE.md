@@ -1,11 +1,57 @@
 # Setting up the Google Docs review mode
 
-This is a one-time setup. It gets you a **"Claude Review"** identity that Claude
-uses to post replies in your Google Docs comment threads, and the OAuth
-credentials the local bridge (`gdocs_review.py`) needs to act as it.
+This is a one-time setup. It gets you a separate identity that Claude uses to
+post replies in your Google Docs comment threads, and the credentials the local
+bridge (`gdocs_review.py`) needs to act as it.
 
 You do this once; afterwards the loop is just "highlight text, comment, ask
 Claude to do a pass."
+
+## Pick an identity: service account (simpler) or OAuth account
+
+The bridge auto-detects which one you saved as `credentials.json`:
+
+- **Service account (recommended).** A non-human Google identity with its own
+  key file. No browser sign-in, no consent screen, no token to refresh — you
+  just share docs with its email. Trade-off: comment replies are authored by the
+  service account's **email address** (e.g.
+  `claude@…iam.gserviceaccount.com`), since service accounts have no display
+  name in Drive. Clearly distinct from you, just not a pretty name. See
+  **§A** below.
+- **OAuth "Claude Review" account.** A real Gmail account you sign in as once;
+  replies show a clean display name like "Claude Review". Trade-off: requires
+  creating the account and an interactive sign-in (a browser, or an SSH port
+  forward on a headless box). See **§B** below.
+
+---
+
+## §A. Service account (recommended)
+
+1. Open <https://console.cloud.google.com/> and create a project (e.g.
+   "claude-doc-review").
+2. **Enable the APIs.** APIs & Services → Library → enable both **Google Drive
+   API** and **Google Docs API**.
+3. **Create the service account.** IAM & Admin → Service Accounts → Create.
+   - Give it a name (e.g. "claude"). **Skip the optional "grant access to
+     project" / roles step** — project IAM roles are irrelevant to Docs; access
+     is granted by sharing each doc with the account.
+4. **Create a key.** Open the service account → **Keys** → Add key → Create new
+   key → **JSON** → Create. A JSON file downloads.
+5. **Save the key** next to `gdocs_review.py` as `credentials.json` (git-ignored).
+   On a headless box, `scp` it over.
+6. **Verify:** `python3 gdocs_review.py auth` — it should print the service
+   account's email with no browser step.
+7. **Share your docs** with the service account's email (shown in the Service
+   Accounts list, like `claude@<project>.iam.gserviceaccount.com`) as
+   **Editor**, the same way you'd share with a person.
+
+That's it — skip §B. Now use the loop in the README under "Google Docs mode".
+
+---
+
+## §B. OAuth "Claude Review" account
+
+Use this only if you want a clean display name on replies.
 
 ## 1. Create the "Claude Review" Google account
 

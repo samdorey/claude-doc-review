@@ -26,6 +26,10 @@ Commands:
   gdocs_review.py resolve <comment_id> <doc>    Resolve a thread (optionally with a note).
   gdocs_review.py comment "msg" <doc> [--quote "text"]
                                                 Post a new (un-anchored) comment.
+  gdocs_review.py apply <comment_id> "new" <doc> [--resolve]
+                                                Apply an approved rewrite to a thread's
+                                                anchored text (leaves the thread open
+                                                unless --resolve is given).
   gdocs_review.py replace "old" "new" <doc>     Edit the doc text directly (Docs API).
 
 <doc> may be a full Google Docs URL or a bare document id.
@@ -67,35 +71,60 @@ def doc_id(ref):
     return ref
 
 
-def services():
-    """Build authenticated Drive + Docs API clients, refreshing/creating the token."""
+def _is_service_account(path):
+    """credentials.json may be an OAuth desktop client or a service-account key."""
     try:
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        from google_auth_oauthlib.flow import InstalledAppFlow
+        import json
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("type") == "service_account"
+    except (OSError, ValueError):
+        return False
+
+
+def services():
+    """Build authenticated Drive + Docs API clients.
+
+    credentials.json may be either a service-account key (no browser; the SA is
+    itself the 'Claude Review' identity) or an OAuth desktop client (interactive
+    sign-in as a real account, token cached under .review/).
+    """
+    try:
         from googleapiclient.discovery import build
     except ImportError:
         die("missing dependencies. Run:  pip install -r requirements.txt")
 
-    creds = None
-    if os.path.exists(TOKEN):
-        creds = Credentials.from_authorized_user_file(TOKEN, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(CREDENTIALS):
-                die(
-                    "no credentials.json found next to this script.\n"
-                    "See SETUP_GOOGLE.md to create OAuth desktop credentials, then "
-                    "save them as:\n  " + CREDENTIALS
-                )
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
-            print("Opening a browser to sign in. Sign in as the *Claude Review* account.")
-            creds = flow.run_local_server(port=0)
-        os.makedirs(os.path.dirname(TOKEN), exist_ok=True)
-        with open(TOKEN, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+    if not os.path.exists(CREDENTIALS):
+        die(
+            "no credentials.json found next to this script.\n"
+            "See SETUP_GOOGLE.md — save either a service-account key or an OAuth "
+            "desktop client as:\n  " + CREDENTIALS
+        )
+
+    if _is_service_account(CREDENTIALS):
+        from google.oauth2 import service_account
+        creds = service_account.Credentials.from_service_account_file(
+            CREDENTIALS, scopes=SCOPES
+        )
+    else:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from google_auth_oauthlib.flow import InstalledAppFlow
+
+        creds = None
+        if os.path.exists(TOKEN):
+            creds = Credentials.from_authorized_user_file(TOKEN, SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
+                print("Sign in as the *Claude Review* account in the browser that opens "
+                      "(or, over SSH, the URL printed below — make sure port 8765 is forwarded).")
+                creds = flow.run_local_server(port=8765, open_browser=False)
+            os.makedirs(os.path.dirname(TOKEN), exist_ok=True)
+            with open(TOKEN, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     docs = build("docs", "v1", credentials=creds, cache_discovery=False)
     return drive, docs
@@ -157,10 +186,14 @@ def cmd_auth(args):
     drive, _ = services()
     name, email = whoami(drive)
     print(f"Authenticated as: {name} <{email}>")
-    if "review" not in (name + email).lower():
-        print("note: this doesn't look like the 'Claude Review' account — "
-              "replies will be authored by whoever you signed in as.")
-    print(f"Token cached at: {TOKEN}")
+    if _is_service_account(CREDENTIALS):
+        print("Using a service-account key. Share each doc with this address as "
+              "Editor; replies are authored by this account.")
+    else:
+        if "review" not in (name + email).lower():
+            print("note: this doesn't look like the 'Claude Review' account — "
+                  "replies will be authored by whoever you signed in as.")
+        print(f"Token cached at: {TOKEN}")
 
 
 def cmd_status(args):
@@ -176,7 +209,8 @@ def cmd_status(args):
     if not comments:
         print("  (none)")
     for c in comments:
-        quoted = squash(c.get("quotedFileContent", {}).get("value", ""), 200)
+        import html
+        quoted = squash(html.unescape(c.get("quotedFileContent", {}).get("value", "")), 200)
         author = c.get("author", {}).get("displayName", "?")
         print(f"[{c['id']}] by {author}" + (f" · on: \"{quoted}\"" if quoted else " · (no highlight)"))
         print(f"     >> {squash(c.get('content', ''), 500)}")
@@ -233,6 +267,56 @@ def cmd_comment(args):
           "to specific text, reply to a comment the user anchored instead.")
 
 
+def cmd_apply(args):
+    """Apply a proposed rewrite tied to a comment's anchored text, then resolve.
+
+    Pulls the comment's highlighted (quoted) text and replaces that exact string
+    in the doc with the new text — so the approved change lands on the spot the
+    user anchored, without restating the original. Resolves the thread unless
+    --no-resolve is given.
+    """
+    drive, docs = services()
+    did = doc_id(args.doc)
+    c = drive.comments().get(
+        fileId=did, commentId=args.comment_id,
+        fields="id,quotedFileContent/value,resolved",
+    ).execute()
+    import html
+    # The API returns quoted text HTML-escaped (e.g. that&#39;s); the doc body
+    # holds the literal characters, so unescape before matching.
+    original = html.unescape(c.get("quotedFileContent", {}).get("value", ""))
+    if not original:
+        die(f"comment {args.comment_id} has no anchored text to replace. "
+            f'Use `replace "old" "new"` with explicit text instead.')
+    res = docs.documents().batchUpdate(
+        documentId=did,
+        body={"requests": [{
+            "replaceAllText": {
+                "containsText": {"text": original, "matchCase": True},
+                "replaceText": args.new,
+            }
+        }]},
+    ).execute()
+    n = res.get("replies", [{}])[0].get("replaceAllText", {}).get("occurrencesChanged", 0)
+    if n == 0:
+        die(f'the anchored text was not found verbatim in the doc '
+            f'(it may have been edited since): "{squash(original, 120)}". No change made.')
+    body = {"content": args.note or
+            f'Applied your approved change: "{squash(original, 80)}" → "{squash(args.new, 80)}".'}
+    if args.resolve:
+        body["action"] = "resolve"
+    drive.replies().create(
+        fileId=did, commentId=args.comment_id, body=body, fields="id,action",
+    ).execute()
+    # Leave the thread open by default so the confirmation reply stays visible in
+    # the sidebar — resolving collapses it out of view into the comment history.
+    suffix = " and resolved the thread" if args.resolve else " (thread left open for your review)"
+    print(f"Applied change for {args.comment_id} ({n} occurrence(s)){suffix}.")
+    if n > 1:
+        print(f"note: the anchored text appeared {n} times in the doc — all were "
+              "replaced. Check the others weren't unintended.")
+
+
 def cmd_replace(args):
     _, docs = services()
     did = doc_id(args.doc)
@@ -274,6 +358,14 @@ def main():
     p.add_argument("doc")
     p.add_argument("--quote", help="text to reference for location context")
 
+    p = sub.add_parser("apply", help="apply an approved rewrite to a comment's anchored text, then resolve")
+    p.add_argument("comment_id")
+    p.add_argument("new", help="the replacement text the user approved")
+    p.add_argument("doc")
+    p.add_argument("--note", help="reply text to leave (defaults to a summary of the change)")
+    p.add_argument("--resolve", action="store_true",
+                   help="also resolve the thread (default: leave it open so the reply stays visible)")
+
     p = sub.add_parser("replace", help="edit the doc text directly (Docs API)")
     p.add_argument("old")
     p.add_argument("new")
@@ -283,7 +375,8 @@ def main():
     cmd = args.command or "help"
     fn = {
         "auth": cmd_auth, "status": cmd_status, "reply": cmd_reply,
-        "resolve": cmd_resolve, "comment": cmd_comment, "replace": cmd_replace,
+        "resolve": cmd_resolve, "comment": cmd_comment, "apply": cmd_apply,
+        "replace": cmd_replace,
     }.get(cmd)
     if not fn:
         ap.print_help()
