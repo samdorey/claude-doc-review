@@ -140,6 +140,16 @@ Inspect it with `journalctl _SYSTEMD_USER_UNIT=gdocs-review.service` (idle passe
 
 > ⚠️ The watcher writes to docs **autonomously once you 👍** — the 👍 is the only gate — and it acts on *every* doc shared with the service account. Share deliberately.
 
+### Known limitation: multi-tab docs aren't supported (yet)
+
+Google Docs can hold [multiple tabs](https://support.google.com/docs/answer/15499791) in one document. This tool currently reads and edits a doc's **single default body**, so multi-tab docs are detected and **skipped** with a one-time comment rather than risk editing the wrong tab. The reasons it isn't just a quick fix:
+
+- **Reads hit the wrong tab.** `documents.get` returns only the first tab's body unless you pass `includeTabsContent`; without tab-awareness the tool would feed Claude the wrong content and locate edits in the wrong place.
+- **Edits could clobber other tabs.** `replaceAllText` spans *all* tabs by default. Docs commonly keep several draft versions in sibling tabs (v1, v2, v3…), so an edit meant for one tab would also rewrite the identical text in the old drafts. Targeting a single tab needs the comment's `tabId`.
+- **The comment→tab mapping is blocked.** A comment's `anchor` field encodes its tab, but the Drive API returns **403 Forbidden** for that field under a service account. Without it, the tab has to be *inferred* by matching the anchored text — which is ambiguous precisely when the same text exists in several version tabs.
+
+Proper support (tab-aware reads, tab-targeted edits, and refusing rather than guessing when the tab is ambiguous) is the next milestone.
+
 ## Notes
 
 - Without the GUI you can review in any editor using CriticMarkup directly; `review.py` reads it the same way, and picks up direct prose rewrites via the baseline diff.
