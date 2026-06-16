@@ -22,6 +22,9 @@ anchored, so Claude's feedback stays attached to your highlighted text.
 Commands:
   gdocs_review.py auth                          One-time sign-in (as Claude Review).
   gdocs_review.py status <doc>                  Open threads + doc body for context.
+  gdocs_review.py run <doc> [--model ID]        For each open thread addressed to Claude
+                                                with no reply yet, generate a rewrite via
+                                                the Claude API and post it as a proposal.
   gdocs_review.py reply <comment_id> "msg" <doc> Reply in a thread, as Claude Review.
   gdocs_review.py resolve <comment_id> <doc>    Resolve a thread (optionally with a note).
   gdocs_review.py comment "msg" <doc> [--quote "text"]
@@ -229,6 +232,109 @@ def cmd_status(args):
     print("Resolve with:  gdocs_review.py resolve <comment_id> " + args.doc)
 
 
+RUN_SYSTEM = (
+    "You are a careful copy editor working inside a Google Doc. You are given the "
+    "full document for context, a highlighted excerpt from it, and the reader's "
+    "instruction about that excerpt. Produce a revised version of ONLY the "
+    "highlighted excerpt that satisfies the instruction while preserving the "
+    "author's meaning, voice, and the flow into the surrounding text. Output only "
+    "the replacement text — no quotation marks, no preamble, no explanation."
+)
+
+
+def _thread_instruction(comment, claude_email):
+    """The reader's request: the comment plus any of their follow-up replies."""
+    import html
+    parts = [html.unescape(comment.get("content", "")).strip()]
+    for r in comment.get("replies", []):
+        if r.get("author", {}).get("displayName") == claude_email:
+            continue
+        text = html.unescape(r.get("content", "")).strip()
+        if text:
+            parts.append(text)
+    return "\n".join(p for p in parts if p)
+
+
+def cmd_run(args):
+    import html
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        die("ANTHROPIC_API_KEY is not set. Export your Claude API key first.")
+    try:
+        import anthropic
+    except ImportError:
+        die("the 'anthropic' package is missing. Run:  pip install -r requirements.txt")
+
+    model = args.model or os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-6"
+
+    drive, docs = services()
+    did = doc_id(args.doc)
+    _, claude_email = whoami(drive)
+    title, body = doc_text(docs, did)
+    comments = list_comments(drive, did)
+
+    def addressed_to_claude(c):
+        blob = c.get("content", "") + " " + " ".join(
+            r.get("content", "") for r in c.get("replies", [])
+        )
+        low = blob.lower()
+        return claude_email.lower() in low or "@claude" in low
+
+    def already_handled(c):
+        return any(
+            r.get("author", {}).get("displayName") == claude_email
+            for r in c.get("replies", [])
+        )
+
+    todo = [
+        c for c in comments
+        if c.get("quotedFileContent", {}).get("value")
+        and addressed_to_claude(c)
+        and not already_handled(c)
+    ]
+
+    print(f"Doc: {title or did}")
+    print(f"Model: {model}")
+    print(f"Open threads for Claude with no reply yet: {len(todo)}")
+    if not todo:
+        return
+
+    client = anthropic.Anthropic()
+    system = [
+        {"type": "text", "text": RUN_SYSTEM},
+        {
+            "type": "text",
+            "text": f"FULL DOCUMENT (for context only):\n\n{body}",
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+    for c in todo:
+        excerpt = html.unescape(c.get("quotedFileContent", {}).get("value", ""))
+        instruction = _thread_instruction(c, claude_email)
+        user = (
+            f"Highlighted excerpt:\n{excerpt}\n\n"
+            f"Reader's instruction:\n{instruction}\n\n"
+            "Return only the rewritten replacement for the highlighted excerpt."
+        )
+        resp = client.messages.create(
+            model=model,
+            max_tokens=2000,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        rewrite = "".join(b.text for b in resp.content if b.type == "text").strip()
+        cached = resp.usage.cache_read_input_tokens
+        body_reply = (
+            "Proposed rewrite (reply 👍 / yes to apply):\n\n" + rewrite
+        )
+        drive.replies().create(
+            fileId=did, commentId=c["id"], body={"content": body_reply},
+            fields="id",
+        ).execute()
+        print(f"[{c['id']}] proposed ({len(rewrite)} chars, cache_read={cached} tok): "
+              f"{squash(rewrite, 80)}")
+
+
 def cmd_reply(args):
     drive, _ = services()
     did = doc_id(args.doc)
@@ -342,6 +448,10 @@ def main():
     p = sub.add_parser("status", help="open threads + doc body")
     p.add_argument("doc", help="Google Docs URL or document id")
 
+    p = sub.add_parser("run", help="generate rewrites for open Claude-addressed threads via the Claude API")
+    p.add_argument("doc", help="Google Docs URL or document id")
+    p.add_argument("--model", help="Claude model id (default: $ANTHROPIC_MODEL or claude-sonnet-4-6)")
+
     p = sub.add_parser("reply", help="reply in a comment thread")
     p.add_argument("comment_id")
     p.add_argument("message")
@@ -374,7 +484,7 @@ def main():
     args = ap.parse_args()
     cmd = args.command or "help"
     fn = {
-        "auth": cmd_auth, "status": cmd_status, "reply": cmd_reply,
+        "auth": cmd_auth, "status": cmd_status, "run": cmd_run, "reply": cmd_reply,
         "resolve": cmd_resolve, "comment": cmd_comment, "apply": cmd_apply,
         "replace": cmd_replace,
     }.get(cmd)

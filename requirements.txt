@@ -2,3 +2,5 @@
 # The Markdown tool (reviewer.py / review.py) needs none of these — stdlib only.
 google-api-python-client>=2.0
 google-auth-oauthlib>=1.0
+# Only needed for `gdocs_review.py run` (Claude-generated rewrites).
+anthropic>=0.40
