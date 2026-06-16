@@ -267,11 +267,20 @@ RUN_SYSTEM = (
     "author's meaning, voice, and the flow into the surrounding text. Output only "
     "the replacement text — no quotation marks, no preamble, no explanation.\n"
     "If the reader asks you to delete or remove the highlighted excerpt entirely "
-    "(rather than rewrite it), respond with exactly <<DELETE>> and nothing else."
+    "(rather than rewrite it), respond with exactly <<DELETE>> and nothing else.\n"
+    "If the reader asks ONLY to change formatting (italic, bold, or underline) "
+    "without changing the wording, respond with exactly <<FORMAT>> on the first "
+    "line, then a JSON object on the next line of the form "
+    '{\"spans\": [{\"text\": \"<exact substring copied verbatim from the excerpt>\", '
+    '\"italic\": true, \"bold\": false, \"underline\": false}, ...]}. '
+    "Include one span per distinct substring to restyle; copy each substring "
+    "exactly as it appears (including punctuation). Omit a style key to leave it unchanged."
 )
 
 DELETE_SENTINEL = "<<DELETE>>"  # what the model emits for a deletion request
 DELETE_MARKER = "[delete this passage entirely]"  # human-readable form shown in the proposal
+FORMAT_SENTINEL = "<<FORMAT>>"  # what the model emits for a formatting-only request
+FORMAT_MARKER = "<<FMT>>"  # precedes the base64 directive embedded in the proposal reply
 
 
 PROPOSAL_PREFIX = "Proposed rewrite"
@@ -336,6 +345,63 @@ def _resolve_model(args):
             or "claude-opus-4-8")
 
 
+def _format_proposal(rewrite):
+    """Turn a model <<FORMAT>> reply into (human_summary, base64_directive).
+
+    Returns None if the directive can't be parsed. The directive is base64 so it
+    survives Google's comment storage (HTML-escaping, <br> insertion) intact.
+    """
+    import json, base64
+    body = rewrite[len(FORMAT_SENTINEL):].strip()
+    try:
+        spans = json.loads(body).get("spans", [])
+    except (ValueError, AttributeError):
+        return None
+    spans = [s for s in spans if isinstance(s, dict) and s.get("text")]
+    if not spans:
+        return None
+    styles = []
+    for k in ("bold", "italic", "underline"):
+        if any(s.get(k) for s in spans):
+            styles.append(k)
+    phrases = ", ".join(f'"{squash(s["text"], 50)}"' for s in spans)
+    summary = f"[formatting] {'/'.join(styles) or 'restyle'}: {phrases}"
+    directive = base64.b64encode(json.dumps({"spans": spans}).encode()).decode()
+    return summary, directive
+
+
+def _apply_formatting(docs, did, spans):
+    """Apply bold/italic/underline to each span's occurrences. Returns ranges styled.
+
+    Matches each span's text within a single text run (sufficient for short
+    phrases); spans straddling runs are skipped. Indices are UTF-16 per the Docs
+    API — fine for BMP text, which doc bodies effectively always are."""
+    doc = docs.documents().get(documentId=did).execute()
+    runs = []
+    for el in doc.get("body", {}).get("content", []):
+        for pe in el.get("paragraph", {}).get("elements", []):
+            tr = pe.get("textRun")
+            if tr is not None and pe.get("startIndex") is not None:
+                runs.append((tr.get("content", ""), pe["startIndex"]))
+    requests = []
+    for span in spans:
+        text = span.get("text", "")
+        fields = [k for k in ("bold", "italic", "underline") if k in span]
+        if not text or not fields:
+            continue
+        style = {k: bool(span[k]) for k in fields}
+        for content, start in runs:
+            i = content.find(text)
+            while i != -1:
+                requests.append({"updateTextStyle": {
+                    "range": {"startIndex": start + i, "endIndex": start + i + len(text)},
+                    "textStyle": style, "fields": ",".join(fields)}})
+                i = content.find(text, i + len(text))
+    if requests:
+        docs.documents().batchUpdate(documentId=did, body={"requests": requests}).execute()
+    return len(requests)
+
+
 def _propose_doc(drive, docs, did, claude_email, client, model, verbose=False):
     """Post Claude-generated rewrite proposals on new threads addressed to Claude."""
     import html
@@ -361,7 +427,18 @@ def _propose_doc(drive, docs, did, claude_email, client, model, verbose=False):
             messages=[{"role": "user", "content": user}],
         )
         rewrite = "".join(b.text for b in resp.content if b.type == "text").strip()
-        shown = DELETE_MARKER if rewrite == DELETE_SENTINEL else rewrite
+        if rewrite == DELETE_SENTINEL:
+            shown = DELETE_MARKER
+        elif rewrite.startswith(FORMAT_SENTINEL):
+            fmt = _format_proposal(rewrite)
+            if not fmt:
+                if verbose:
+                    print(f"  [{c['id']}] skipped (couldn't parse formatting directive)")
+                continue
+            summary, directive = fmt
+            shown = f"{summary}\n{FORMAT_MARKER}{directive}"
+        else:
+            shown = rewrite
         drive.replies().create(
             fileId=did, commentId=c["id"],
             body={"content": PROPOSAL_PREFIX + " (reply 👍 / yes to apply):\n\n" + shown},
@@ -399,6 +476,36 @@ def _apply_approved_doc(drive, docs, did, claude_email, verbose=False):
             continue
         new_text = proposal_text.split("\n\n", 1)[1] if "\n\n" in proposal_text else proposal_text
         new_text = html.unescape(new_text).rsplit("<br>", 1)[0].strip()
+
+        # Formatting-only change: decode the embedded base64 directive and restyle.
+        if FORMAT_MARKER in new_text:
+            import json, base64
+            token = new_text.split(FORMAT_MARKER, 1)[1].replace("<br>", "").strip()
+            try:
+                spans = json.loads(base64.b64decode(token).decode()).get("spans", [])
+            except Exception:
+                spans = []
+            styled = _apply_formatting(docs, did, spans) if spans else 0
+            if styled == 0:
+                drive.replies().create(
+                    fileId=did, commentId=c["id"],
+                    body={"content": CANT_APPLY_PREFIX + " — couldn't locate the text to "
+                          "restyle (it may have changed). Re-comment to try again."},
+                    fields="id",
+                ).execute()
+                if verbose:
+                    print(f"  [{c['id']}] could not apply formatting")
+                continue
+            drive.replies().create(
+                fileId=did, commentId=c["id"],
+                body={"content": f"{APPLIED_PREFIX}: restyled {styled} span(s)."},
+                fields="id",
+            ).execute()
+            applied += 1
+            if verbose:
+                print(f"  [{c['id']}] applied formatting ({styled} span(s))")
+            continue
+
         is_delete = new_text == DELETE_MARKER
         replace_with = "" if is_delete else new_text
         res = docs.documents().batchUpdate(
@@ -430,12 +537,17 @@ def _apply_approved_doc(drive, docs, did, claude_email, verbose=False):
 
 
 def docs_shared_with_sa(drive):
-    """Every non-trashed Google Doc the account can see (i.e. shared with it)."""
+    """Every non-trashed Google Doc the account can see — including shared drives.
+
+    corpora=allDrives (+ the allDrives support flags) is required so docs in
+    Workspace shared drives are discovered; the default corpus omits them.
+    """
     out, token = [], None
     while True:
         resp = drive.files().list(
             q="mimeType='application/vnd.google-apps.document' and trashed=false",
             fields="files(id,name),nextPageToken", pageSize=100, pageToken=token,
+            corpora="allDrives", includeItemsFromAllDrives=True, supportsAllDrives=True,
         ).execute()
         out.extend((f["id"], f.get("name", "")) for f in resp.get("files", []))
         token = resp.get("nextPageToken")
