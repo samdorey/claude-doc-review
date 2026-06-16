@@ -50,6 +50,28 @@ import argparse
 HERE = os.path.dirname(os.path.abspath(__file__))
 CREDENTIALS = os.path.join(HERE, "credentials.json")
 TOKEN = os.path.join(HERE, ".review", "google-token.json")
+ENV_FILE = os.path.join(HERE, ".env")
+
+
+def load_env():
+    """Load KEY=VALUE lines from a .env next to this script (e.g. ANTHROPIC_API_KEY).
+
+    Minimal, dependency-free: skips comments/blanks, tolerates an `export ` prefix
+    and surrounding quotes, and never overrides a variable already in the environment.
+    """
+    if not os.path.exists(ENV_FILE):
+        return
+    with open(ENV_FILE, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip('"').strip("'")
+            if key:
+                os.environ.setdefault(key, val)
 
 # Drive scope is needed to read/post comments; documents to read/edit the body.
 SCOPES = [
@@ -440,6 +462,7 @@ def cmd_replace(args):
 
 
 def main():
+    load_env()
     ap = argparse.ArgumentParser(description="Review a Google Doc via native comments.")
     sub = ap.add_subparsers(dest="command")
 
